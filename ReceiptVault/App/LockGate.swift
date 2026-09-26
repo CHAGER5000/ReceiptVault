@@ -9,6 +9,14 @@ struct LockGate<Content: View>: View {
     @Environment(\.scenePhase) private var scenePhase
     @State private var unlocked = false
     @State private var authenticating = false
+    /// True at launch and after the app has been in the background, until the
+    /// scene is next active or a prompt starts. The Face ID / passcode prompt itself makes the
+    /// scene inactive and then active again, so asking on every return to
+    /// active would show a cancelled prompt again and again.
+    @State private var askWhenActive = true
+    /// Counts the trips to the background. A prompt that succeeds only after
+    /// the app has gone to the background again does not unlock the new session.
+    @State private var lockEpoch = 0
 
     var body: some View {
         ZStack {
@@ -22,10 +30,33 @@ struct LockGate<Content: View>: View {
             }
         }
         .onChange(of: scenePhase) { _, phase in
-            if phase == .background { unlocked = false }
-            if phase == .active && !unlocked && lockEnabled { authenticate() }
+            if phase == .background {
+                unlocked = false
+                askWhenActive = true
+                lockEpoch += 1
+            }
+            if phase == .active {
+                let ask = askWhenActive
+                askWhenActive = false
+                if !lockEnabled {
+                    // The gate stays open while the lock is off, so turning
+                    // the lock on in Settings does not lock the screen at once
+                    // (it locks at the next background).
+                    unlocked = true
+                } else if ask && !unlocked {
+                    authenticate()
+                }
+            }
         }
-        .onAppear { if lockEnabled { authenticate() } }
+        .onAppear {
+            if !lockEnabled {
+                unlocked = true
+            } else if scenePhase == .active && !unlocked {
+                authenticate()
+            }
+            // Otherwise the scene is not active yet: the prompt is shown when
+            // it becomes active (askWhenActive is still true).
+        }
     }
 
     private var lockedView: some View {
@@ -49,6 +80,9 @@ struct LockGate<Content: View>: View {
 
     private func authenticate() {
         guard !authenticating else { return }
+        // A prompt is starting now, so the return to active that follows it
+        // (after a success or a cancel) must not ask again.
+        askWhenActive = false
         let context = LAContext()
         var error: NSError?
         // No passcode set on the phone: nothing to check against.
@@ -57,10 +91,13 @@ struct LockGate<Content: View>: View {
             return
         }
         authenticating = true
+        let epoch: Int = lockEpoch
         context.evaluatePolicy(.deviceOwnerAuthentication, localizedReason: "Unlock your receipts") { success, _ in
             DispatchQueue.main.async {
                 authenticating = false
-                if success { unlocked = true }
+                // A success that arrives after the app went to the background
+                // again belongs to the old session, so the gate stays locked.
+                if success && epoch == lockEpoch { unlocked = true }
             }
         }
     }

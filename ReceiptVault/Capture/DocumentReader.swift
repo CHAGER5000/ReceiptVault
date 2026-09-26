@@ -31,13 +31,24 @@ enum DocumentReader {
             var tokens: [TextToken] = []
             var usedOCR = false
             for i in 0..<count {
-                guard let page = doc.page(at: i) else { continue }
-                let pageTokens = textTokens(page: page, index: i)
-                if pageTokens.count >= 8 {
-                    tokens += pageTokens
-                } else if recognises(page: i, of: count), let image = render(page) {
-                    usedOCR = true
-                    tokens += try recognise(image, page: i)
+                // A rendered page is a large image; release it before the next page.
+                try autoreleasepool {
+                    guard let page = doc.page(at: i) else { return }
+                    let pageTokens = textTokens(page: page, index: i)
+                    if pageTokens.count < 8, recognises(page: i, of: count), let image = render(page) {
+                        let recognised = try recognise(image, page: i)
+                        if recognised.isEmpty {
+                            // Keep the text layer's few words when nothing could be recognised.
+                            tokens += pageTokens
+                        } else {
+                            usedOCR = true
+                            tokens += recognised
+                        }
+                    } else {
+                        // A page with its text, or a page outside the recognised ones:
+                        // whatever text it has is kept rather than dropped.
+                        tokens += pageTokens
+                    }
                 }
                 progress(Double(i + 1) / Double(max(count, 1)))
             }
@@ -52,7 +63,7 @@ enum DocumentReader {
         return try await Task.detached(priority: .userInitiated) {
             var tokens: [TextToken] = []
             for (i, image) in cgImages.enumerated() {
-                tokens += try recognise(image, page: i)
+                tokens += try autoreleasepool { try recognise(image, page: i) }
                 progress(Double(i + 1) / Double(max(cgImages.count, 1)))
             }
             return Output(lines: TextLayout.lines(from: tokens), pages: cgImages.count, usedOCR: true)

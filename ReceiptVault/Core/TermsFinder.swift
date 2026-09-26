@@ -98,9 +98,15 @@ enum TermsFinder {
                     rangeEnd = max(dates[0].date, dates[1].date)
                     rangeDone = true
                 } else if let first = dates.first {
-                    // One date: "Laufzeit bis 31.12.2025" or "Laufzeit ab 01.01.2025".
+                    // One date: "Laufzeit bis 31.12.2025" or "Laufzeit ab (dem) 01.01.2025".
+                    // Only the two words before the date count, and none after a
+                    // notice or payment word ("12 Monate, Kündigung bis 30.09.2025").
                     let leadText = ns.substring(with: NSRange(location: hit.keyEnd, length: first.location - hit.keyEnd))
-                    let lead = Set(TermsFinder.plainWords(leadText))
+                    let leadWords = TermsFinder.plainWords(leadText)
+                    let blocked = leadWords.contains(where: { w in
+                        TermsFinder.noticeSingles.contains(w) || TermsFinder.paymentWords.contains(w)
+                    })
+                    let lead: Set<String> = blocked ? Set<String>() : Set(leadWords.suffix(2))
                     if !lead.isDisjoint(with: TermsFinder.untilWords) {
                         rangeEnd = first.date
                         rangeDone = true
@@ -149,8 +155,8 @@ enum TermsFinder {
             var hi = i
             if !TermsFinder.selfRenewing.contains(text) {
                 guard TermsFinder.renewWords.contains(text) else { continue }
-                // "extended warranty" is not a renewal.
-                if i + 1 < words.count && TermsFinder.warrantySingles.contains(words[i + 1].text) { continue }
+                // "extended warranty", "verlängert sich die Garantie um 1 Jahr": not a renewal.
+                if TermsFinder.isAboutWarranty(i, in: words) { continue }
                 guard let j = TermsFinder.partner(of: i, in: words) else { continue }
                 lo = min(i, j)
                 hi = max(i, j)
@@ -441,6 +447,7 @@ enum TermsFinder {
 
     private static let returnKeys: [[String]] = TermsFinder.phrases([
         "return", "returns", "returned", "returnable", "exchange", "exchanges", "exchanged", "money back",
+        "refund", "refunds",
         "umtausch", "umtauschen", "umtauschrecht", "umtauschfrist", "ruckgabe", "rueckgabe",
         "ruckgaberecht", "rueckgaberecht", "ruckgabefrist", "rueckgabefrist", "zuruckgeben", "zurueckgeben",
         "retoure", "retouren", "geld zuruck", "geld zurueck",
@@ -470,15 +477,22 @@ enum TermsFinder {
     private static let termWords = TermsFinder.wordSet([
         "laufzeit", "mindestlaufzeit", "vertragslaufzeit", "vertragsdauer", "duration", "duree", "durata", "term",
     ])
+    /// Complaint periods ("Reklamationen innerhalb einer Frist von 8 Tagen"), which are not notice.
+    private static let complaintWords = TermsFinder.wordSet([
+        "reklamation", "reklamationen", "beanstandung", "beanstandungen", "mangel", "mangelruge", "mangelruege",
+        "complaint", "complaints", "claim", "claims", "reclamation", "reclamations", "reclamo", "reclami",
+    ])
 
+    // "money" (not "back") marks a money-back guarantee, so "12 month warranty
+    // (back to base)" is still a warranty.
     private static let warrantyRule = Rule(
         keys: TermsFinder.warrantyKeys,
         modifiers: TermsFinder.wordSet([
-            "money", "back", "price", "prix", "preis", "tiefpreis", "bestpreis", "lowest", "match",
+            "money", "cash", "cashback", "refund", "price", "prix", "preis", "tiefpreis", "bestpreis", "lowest", "match",
             "satisfaction", "satisfait", "satisfied", "rembourse", "geld", "zuruck", "zurueck", "zufriedenheit",
             "soddisfatti", "rimborsati", "frische", "frisch", "freshness", "fraicheur", "freschezza",
         ]),
-        blockers: TermsFinder.returnSingles.union(["money", "back", "geld", "zuruck", "zurueck"]))
+        blockers: TermsFinder.returnSingles.union(["money", "cash", "cashback", "geld", "zuruck", "zurueck"]))
 
     private static let returnRule = Rule(
         keys: TermsFinder.returnKeys,
@@ -487,12 +501,17 @@ enum TermsFinder {
             "elaborato", "elaborati",
         ]))
 
+    // A renewal word between a notice keyword and a length makes it the renewal
+    // period ("wenn nicht gekündigt, automatisch um 12 Monate").
     private static let noticeRule = Rule(
         keys: TermsFinder.noticeKeys,
         blockers: TermsFinder.returnSingles.union(TermsFinder.warrantySingles)
-            .union(TermsFinder.paymentWords).union(TermsFinder.termWords),
+            .union(TermsFinder.paymentWords).union(TermsFinder.termWords)
+            .union(TermsFinder.renewWords).union(TermsFinder.autoWords),
         weakKeys: TermsFinder.wordSet(["frist", "monatsende", "quartalsende"]),
-        weakBlockers: TermsFinder.paymentWords)
+        // "Umtausch innerhalb einer Frist von 14 Tagen" is a return period, not notice.
+        weakBlockers: TermsFinder.paymentWords.union(TermsFinder.returnSingles)
+            .union(TermsFinder.warrantySingles).union(TermsFinder.complaintWords))
 
     /// Every place a keyword phrase appears, not across a sentence break.
     private static func matches(of keys: [[String]], in words: [Word]) -> [KeyMatch] {
@@ -671,23 +690,44 @@ enum TermsFinder {
     ])
 
     /// An automatic or reflexive word that makes the renewal word at `i` automatic.
+    /// An automatic word wins over a reflexive one, so the statement spans any
+    /// negation between them ("verlängert sich der Vertrag nicht automatisch").
     private static func partner(of i: Int, in words: [Word]) -> Int? {
         let word = words[i].text
+        var fallback: Int? = nil
         for step in 1...5 {
             for j in [i - step, i + step] where j >= 0 && j < words.count {
                 if TermsFinder.crossesSentence(i, j, in: words) { continue }
                 let w = words[j].text
-                if step == 1 && TermsFinder.reflexiveWords.contains(w) { return j }
                 if w == "auto" {
                     if j == i - 1 { return j }
                     continue
                 }
                 if TermsFinder.autoWords.contains(w) { return j }
-                // "renews each year unless cancelled"
-                if w == "unless" && j > i && step <= 3 && word.hasPrefix("renew") && word != "renewal" { return j }
+                if fallback != nil { continue }
+                // "verlängert sich", "se renouvelle", "si rinnova" (not "le renouvellement se fait").
+                if step == 1 && TermsFinder.reflexiveWords.contains(w) && (w == "sich" || j == i - 1) {
+                    fallback = j
+                } else if w == "unless" && j > i && step <= 3 && word.hasPrefix("renew") && word != "renewal" {
+                    // "renews each year unless cancelled"
+                    fallback = j
+                }
             }
         }
-        return nil
+        return fallback
+    }
+
+    /// A warranty word up to two words before the renewal word at `i`, or up to
+    /// three after it, in the same sentence: a warranty extension.
+    private static func isAboutWarranty(_ i: Int, in words: [Word]) -> Bool {
+        let lo = max(0, i - 2)
+        let hi = min(words.count - 1, i + 3)
+        for j in lo...hi where j != i {
+            if !TermsFinder.crossesSentence(i, j, in: words) && TermsFinder.warrantySingles.contains(words[j].text) {
+                return true
+            }
+        }
+        return false
     }
 
     private static func hasAutoWord(near i: Int, in words: [Word]) -> Bool {
@@ -855,13 +895,22 @@ enum TermsFinder {
         return between.allSatisfy { w in TermsFinder.rangeWords.contains(w) || w.allSatisfy({ $0.isNumber }) }
     }
 
-    /// The first year or month length in `text`, in months ("12 Monate").
+    /// The year or month length printed right after a term label, in months:
+    /// "12 Monate", "des Vertrages: 24 Monate", "mind. 24 Monate". A length
+    /// further on, after a comma or after a notice word is not the term's
+    /// ("unbefristet, Kündigungsfrist 3 Monate").
     private static func monthsOfTerm(_ text: String) -> Int? {
-        for d in TermsFinder.durations(TermsFinder.scan(text)) where d.unit == .year || d.unit == .month {
-            let months = d.unit == .year ? d.value * 12 : d.value
-            if (1...120).contains(months) { return months }
+        let words = TermsFinder.scan(text)
+        guard let d = TermsFinder.durations(words).first(where: { $0.unit == .year || $0.unit == .month }),
+              d.numberIndex <= 3, !TermsFinder.looksLikeNotice(d, in: words) else { return nil }
+        for k in 0..<d.numberIndex {
+            if TermsFinder.noticeSingles.contains(words[k].text) { return nil }
+            // A comma, or a full stop that does not end a short abbreviation ("ca.", "mind.").
+            let gap = words[k + 1].gap
+            if gap == 1 || (gap >= 3 && words[k].text.count > 4) { return nil }
         }
-        return nil
+        let months = d.unit == .year ? d.value * 12 : d.value
+        return (1...120).contains(months) ? months : nil
     }
 
     /// The earliest word-bounded match of any key (the longest when two start together).

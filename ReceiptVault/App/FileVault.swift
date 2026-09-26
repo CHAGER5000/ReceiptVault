@@ -148,8 +148,10 @@ enum FileVault {
         return writeThumbnail(image, for: fileName)
     }
 
+    /// Deletes originals and thumbnails by name. Only bare names are accepted,
+    /// so a damaged record ('', '.', '..', 'a/b') can never remove a folder.
     static func delete(_ names: [String]) {
-        for name in names where !name.isEmpty && !name.contains("/") {
+        for name in names where isPlainName(name) {
             try? FileManager.default.removeItem(at: url(name))
             cache.removeObject(forKey: name as NSString)
         }
@@ -158,9 +160,11 @@ enum FileVault {
     // MARK: Hashes
 
     /// SHA-256 of the stored bytes, or nil when the file cannot be read.
+    /// The file is read, not memory-mapped: a mapped file with complete
+    /// protection faults (a crash, not an error) if the phone locks meanwhile.
     static func sha256(_ name: String) -> String? {
         guard !name.isEmpty,
-              let data = try? Data(contentsOf: url(name), options: .mappedIfSafe) else { return nil }
+              let data = try? Data(contentsOf: url(name)) else { return nil }
         return FileVault.sha256(data: data)
     }
 
@@ -172,43 +176,20 @@ enum FileVault {
     // MARK: Incoming files
 
     /// Copies a picked or shared file into Staging/Incoming as '<UUID>.<ext>'
-    /// with complete protection. A file that iOS put in Documents/Inbox is then
-    /// removed, so it only ever waits in the protected folder.
+    /// with complete protection. A file that iOS put in this app's own
+    /// Documents/Inbox is then removed, so it only ever waits in the protected
+    /// folder. (A file picked from another app's 'Inbox' folder is left alone.)
     static func stageIncoming(_ url: URL) throws -> URL {
-        let access = url.startAccessingSecurityScopedResource()
-        defer { if access { url.stopAccessingSecurityScopedResource() } }
-        let dir = Storage.incomingDirectory
-        ensureDirectory(dir, excludeFromBackup: true)
-        let ext = url.pathExtension.lowercased()
-        let name = ext.isEmpty ? UUID().uuidString : UUID().uuidString + "." + ext
-        let destination = dir.appendingPathComponent(name, isDirectory: false)
-        do {
-            try FileManager.default.copyItem(at: url, to: destination)
-        } catch {
-            throw AppError.message("That file could not be copied into ReceiptVault.")
-        }
-        // The modification date records the arrival order for pendingIncoming().
-        let attributes: [FileAttributeKey: Any] = [.protectionKey: FileProtectionType.complete,
-                                                   .modificationDate: Date()]
-        do {
-            try FileManager.default.setAttributes(attributes, ofItemAtPath: destination.path)
-        } catch {
-            try? FileManager.default.removeItem(at: destination)
-            throw AppError.message("That file could not be protected, so it was not kept.")
-        }
-        if url.path.contains("/Documents/Inbox/") {
-            try? FileManager.default.removeItem(at: url)
-        }
-        return destination
+        try stage(url, removingSource: isInInbox(url))
     }
 
     /// Files waiting in Staging/Incoming, oldest first. Leftovers in
     /// Documents/Inbox are staged first.
     static func pendingIncoming() -> [URL] {
-        let docs = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0]
-        let inbox = docs.appendingPathComponent("Inbox", isDirectory: true)
-        for leftover in regularFiles(in: inbox) {
-            _ = try? stageIncoming(leftover)
+        for leftover in regularFiles(in: inboxDirectory) {
+            // Always moved out (or left untouched on failure), so the same
+            // leftover can never be staged twice.
+            _ = try? stage(leftover, removingSource: true)
         }
         return regularFiles(in: Storage.incomingDirectory).sorted { a, b in
             let da = modified(a)
@@ -312,6 +293,70 @@ enum FileVault {
         }
     }
 
+    /// Copies `url` into Staging/Incoming as '<UUID>.<ext lowercased>' with
+    /// complete protection. With `removingSource` the source is deleted
+    /// afterwards; when that fails the copy is deleted instead, so a file is
+    /// either moved or left where it was, never staged twice.
+    private static func stage(_ url: URL, removingSource: Bool) throws -> URL {
+        let access = url.startAccessingSecurityScopedResource()
+        defer { if access { url.stopAccessingSecurityScopedResource() } }
+        let dir = Storage.incomingDirectory
+        ensureDirectory(dir, excludeFromBackup: true)
+        let ext = url.pathExtension.lowercased()
+        let name = ext.isEmpty ? UUID().uuidString : UUID().uuidString + "." + ext
+        let destination = dir.appendingPathComponent(name, isDirectory: false)
+        do {
+            try FileManager.default.copyItem(at: url, to: destination)
+        } catch {
+            throw AppError.message("That file could not be copied into ReceiptVault.")
+        }
+        // The modification date records the arrival order for pendingIncoming().
+        let attributes: [FileAttributeKey: Any] = [.protectionKey: FileProtectionType.complete,
+                                                   .modificationDate: Date()]
+        do {
+            try FileManager.default.setAttributes(attributes, ofItemAtPath: destination.path)
+        } catch {
+            try? FileManager.default.removeItem(at: destination)
+            throw AppError.message("That file could not be protected, so it was not kept.")
+        }
+        if removingSource {
+            do {
+                try FileManager.default.removeItem(at: url)
+            } catch {
+                try? FileManager.default.removeItem(at: destination)
+                throw AppError.message("That file could not be moved into ReceiptVault.")
+            }
+        }
+        return destination
+    }
+
+    /// Where iOS copies files opened with 'Open in ReceiptVault'.
+    private static var inboxDirectory: URL {
+        let docs = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0]
+        return docs.appendingPathComponent("Inbox", isDirectory: true)
+    }
+
+    /// True for a file inside this app's own Documents/Inbox.
+    private static func isInInbox(_ url: URL) -> Bool {
+        guard url.isFileURL else { return false }
+        let inbox = comparablePath(inboxDirectory) + "/"
+        return comparablePath(url).hasPrefix(inbox)
+    }
+
+    /// The standardized path without the '/private' prefix iOS sometimes
+    /// adds, so '/var/…' and '/private/var/…' compare equal.
+    private static func comparablePath(_ url: URL) -> String {
+        let path = url.standardizedFileURL.path
+        let prefix = "/private/"
+        guard path.hasPrefix(prefix) else { return path }
+        return String(path.dropFirst(prefix.count - 1))
+    }
+
+    /// A bare file name: not empty, no folder separator, not '.' or '..'.
+    private static func isPlainName(_ name: String) -> Bool {
+        !name.isEmpty && name != "." && name != ".." && !name.contains("/")
+    }
+
     /// Creates a missing folder with complete protection.
     private static func ensureDirectory(_ dir: URL, excludeFromBackup: Bool = false) {
         guard !FileManager.default.fileExists(atPath: dir.path) else { return }
@@ -362,14 +407,16 @@ enum FileVault {
         }
     }
 
-    /// A PDF page drawn with PDFPage.thumbnail, `longEdge` points on its long side.
+    /// A PDF page drawn with PDFPage.thumbnail, `longEdge` points on its long
+    /// side. The crop box is the page as PDF viewers show it (it is the media
+    /// box when the PDF sets none).
     private static func preview(of page: PDFPage, longEdge: CGFloat) -> UIImage? {
-        let bounds = page.bounds(for: .mediaBox)
+        let bounds = page.bounds(for: .cropBox)
         guard bounds.width > 0, bounds.height > 0 else { return nil }
         let scale = longEdge / max(bounds.width, bounds.height)
         var size = CGSize(width: bounds.width * scale, height: bounds.height * scale)
         if page.rotation % 180 != 0 { size = CGSize(width: size.height, height: size.width) }
-        return page.thumbnail(of: size, for: .mediaBox)
+        return page.thumbnail(of: size, for: .cropBox)
     }
 
     /// Everything directly inside a folder, hidden files included.

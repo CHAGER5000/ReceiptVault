@@ -119,13 +119,14 @@ enum Lexicon {
         "rechnungsnummer", "rechnungsnr", "rechnungs-nr", "rechnungsdatum",
     ]
 
-    /// Orders placed online or for delivery.
+    /// Orders placed online or for delivery. The channel guess also counts
+    /// deliveryDateLabels, so no word here repeats one of those.
     static let onlineWords: [String] = [
         "order number", "order no", "bestellnummer", "numero de commande", "delivery", "shipping", "versand",
         "lieferung", "livraison", "spedizione",
         "order confirmation", "order id", "order ref", "online order", "bestellung", "bestellnr", "bestelldatum",
         "versandkosten", "lieferadresse", "lieferanschrift", "commande en ligne", "frais de port",
-        "numero ordine", "dispatched",
+        "numero ordine",
     ]
 
     // MARK: - Merchant

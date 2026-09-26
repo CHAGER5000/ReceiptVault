@@ -1,3 +1,4 @@
+import Foundation
 import XCTest
 @testable import ReceiptCore
 
@@ -98,7 +99,9 @@ final class DatesMoneyTests: XCTestCase {
             XCTAssertFalse(labels.contains(where: { $0.isEmpty }), "\(labels)")
             XCTAssertEqual(Set(labels).count, labels.count, "\(labels)")
         }
-        let symbols = ItemKind.allCases.map { $0.symbol } + DeadlineKind.allCases.map { $0.symbol }
+        let itemSymbols: [String] = ItemKind.allCases.map { $0.symbol }
+        let deadlineSymbols: [String] = DeadlineKind.allCases.map { $0.symbol }
+        let symbols: [String] = itemSymbols + deadlineSymbols
         XCTAssertFalse(symbols.contains(where: { $0.isEmpty }))
     }
 

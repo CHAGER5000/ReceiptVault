@@ -27,12 +27,18 @@ enum Money {
     }
 
     /// Display only. ICU output differs between macOS and iOS, so tests never assert it.
+    /// Always two decimals, matching the minor units stored for every currency (an
+    /// imported item in a zero-decimal currency would otherwise be shown rounded).
     static func format(_ minor: Int64, currency: String) -> String {
+        let code = currency.trimmingCharacters(in: .whitespacesAndNewlines).uppercased()
+        if code.isEmpty { return plain(minor) }
         let f = NumberFormatter()
+        f.locale = Locale(identifier: localeID(for: code))
         f.numberStyle = .currency
-        f.currencyCode = currency
-        f.locale = Locale(identifier: localeID(for: currency))
-        return f.string(from: NSDecimalNumber(decimal: decimal(fromMinor: minor))) ?? "\(plain(minor)) \(currency)"
+        f.currencyCode = code
+        f.minimumFractionDigits = 2
+        f.maximumFractionDigits = 2
+        return f.string(from: NSDecimalNumber(decimal: decimal(fromMinor: minor))) ?? "\(plain(minor)) \(code)"
     }
 
     /// VAT rates are stored in permille: 200 -> "20", 81 -> "8.1", 25 -> "2.5", 0 -> "0".
@@ -152,8 +158,10 @@ enum ReceiptAmountParser {
     /// Letters (and '*') printed after an amount to show its VAT rate.
     private static let vatCodes = "ABCDESZ*"
 
-    /// Swiss whole amounts: "12.–", "12.-", "12,--" -> "12.00".
-    private static let swissDash = try! NSRegularExpression(pattern: #"(\d)[.,][-–—]{1,2}(?!\d)"#)
+    /// Whole amounts: "12.–", "12.-" -> "12.00"; "12,--", "1.249,--" -> "12,00", "1.249,00".
+    /// Only the dashes are replaced, so the decimal separator is kept: turning
+    /// "1.249,--" or "1 249,--" into "…249.00" would make them fail the shape checks.
+    private static let swissDash = try! NSRegularExpression(pattern: #"(?<=\d[.,])[-–—]{1,2}(?![-–—\d])"#)
 
     /// Space thousands separators are accepted only with a decimal comma.
     private static let amountShape = try! NSRegularExpression(
@@ -164,14 +172,14 @@ enum ReceiptAmountParser {
         pattern: #"(?<!\p{L})(?:SFr\.|Fr\.|US\$|USD|CHF|GBP|EUR)(?!\p{L})|(?<!\p{L})\$|£|€"#,
         options: [.caseInsensitive])
 
-    /// Narrow and thin spaces become plain spaces; the Swiss dash becomes ".00".
+    /// No-break, narrow and thin spaces become plain spaces; the whole-amount dash becomes "00".
     /// Runs before any sign handling, so "12.-" is never read as negative.
     static func normalise(_ s: String) -> String {
         let spaced = s.replacingOccurrences(of: "\u{00A0}", with: " ")
             .replacingOccurrences(of: "\u{202F}", with: " ")
             .replacingOccurrences(of: "\u{2009}", with: " ")
         let range = NSRange(location: 0, length: (spaced as NSString).length)
-        return swissDash.stringByReplacingMatches(in: spaced, range: range, withTemplate: "$1.00")
+        return swissDash.stringByReplacingMatches(in: spaced, range: range, withTemplate: "00")
     }
 
     /// ISO 4217 code for a printed currency marker, or nil.
@@ -190,7 +198,7 @@ enum ReceiptAmountParser {
         var s = normalise(token)
             .replacingOccurrences(of: "\u{2212}", with: "-")
             .replacingOccurrences(of: "–", with: "-")
-            .trimmingCharacters(in: .whitespaces)
+            .trimmingCharacters(in: .whitespacesAndNewlines)
         if s.isEmpty || s.contains("%") || s.contains(":") { return nil }
 
         // Record the first currency marker, then strip them all.
@@ -208,6 +216,7 @@ enum ReceiptAmountParser {
         s = s.trimmingCharacters(in: .whitespaces)
 
         // A trailing VAT code after a space or digit: "12.50 A", "12.50*".
+        let beforeVAT = s
         if s.count >= 2, let last = s.last, vatCodes.contains(last) {
             let prev = s[s.index(s.endIndex, offsetBy: -2)]
             if prev == " " || (prev.isASCII && prev.isNumber) {
@@ -215,9 +224,16 @@ enum ReceiptAmountParser {
             }
         }
 
-        if fromOCR && !matchesShape(s) && s.filter({ $0.isNumber }).count >= 2 {
-            let fixed = fixSlips(s)
-            if matchesShape(fixed) { s = fixed }
+        // Text-recognition slips. The text before the VAT strip is tried too, because
+        // 'S' and 'B' are both VAT codes and common slips for 5 and 8 ("12.5S" is 12.55).
+        if fromOCR && !matchesShape(s) {
+            for candidate in [s, beforeVAT] where candidate.filter({ $0.isNumber }).count >= 2 {
+                let fixed = fixSlips(candidate)
+                if matchesShape(fixed) {
+                    s = fixed
+                    break
+                }
+            }
         }
         guard matchesShape(s) else { return nil }
 
@@ -323,12 +339,13 @@ enum ReceiptAmountParser {
     }
 
     /// True when `rest` starts, after at most one space, with an amount of one or two tokens.
+    /// A trailing '.' is not trimmed: "Fr. 12.03." is Freitag, 12 March, not 12.03 francs.
     private static func amountFollows(_ rest: String) -> Bool {
         var s = Substring(rest)
         if let f = s.first, f.isWhitespace { s = s.dropFirst() }
         guard let c = s.first, c.isASCII, c.isNumber else { return false }
         let pieces = s.split(maxSplits: 2, whereSeparator: { $0.isWhitespace })
-        let trim = CharacterSet(charactersIn: ".,;)")
+        let trim = CharacterSet(charactersIn: ",;)")
         let first = String(pieces[0]).trimmingCharacters(in: trim)
         if parse(first) != nil { return true }
         guard pieces.count > 1 else { return false }

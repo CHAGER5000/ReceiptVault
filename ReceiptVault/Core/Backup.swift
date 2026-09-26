@@ -268,9 +268,11 @@ enum BackupEntry: Equatable {
             if dashes.contains(i) {
                 guard b[i] == 0x2D else { return false }  // '-'
             } else {
-                let c = b[i]
-                let isHex = (c >= 0x30 && c <= 0x39) || (c >= 0x41 && c <= 0x46) || (c >= 0x61 && c <= 0x66)
-                guard isHex else { return false }
+                let c: UInt8 = b[i]
+                let isDigit: Bool = c >= 0x30 && c <= 0x39   // 0-9
+                let isUpper: Bool = c >= 0x41 && c <= 0x46   // A-F
+                let isLower: Bool = c >= 0x61 && c <= 0x66   // a-f
+                guard isDigit || isUpper || isLower else { return false }
             }
         }
         let ext = String(decoding: b[36..<40], as: UTF8.self)
@@ -300,7 +302,7 @@ final class BackupWriter {
         let fm = FileManager.default
         if fm.fileExists(atPath: url.path) { try fm.removeItem(at: url) }
         #if os(iOS)
-        let attributes: [FileAttributeKey: Any]? = [.protectionKey: FileProtectionType.complete]
+        let attributes: [FileAttributeKey: Any]? = [FileAttributeKey.protectionKey: FileProtectionType.complete]
         #else
         let attributes: [FileAttributeKey: Any]? = nil
         #endif
@@ -323,11 +325,18 @@ final class BackupWriter {
         try? handle?.close()
     }
 
-    /// Seals the entry as the next frame.
+    /// Seals the entry as the next frame. A failed write closes the file, so
+    /// a half-written frame is never followed by more frames.
     func append(_ entry: BackupEntry) throws {
         guard let handle = handle else { throw BackupError.badEntry }
         let frame = try BackupCrypto.sealFrame(entry.encoded(), index: index, header: header, key: key)
-        try handle.write(contentsOf: frame)
+        do {
+            try handle.write(contentsOf: frame)
+        } catch {
+            self.handle = nil
+            try? handle.close()
+            throw error
+        }
         index += 1
     }
 
@@ -336,7 +345,12 @@ final class BackupWriter {
         try append(.end(frames: index))
         guard let handle = handle else { return }
         self.handle = nil
-        try handle.synchronize()
+        do {
+            try handle.synchronize()
+        } catch {
+            try? handle.close()
+            throw error
+        }
         try handle.close()
     }
 }
@@ -357,18 +371,21 @@ final class BackupReader {
     /// is only noticed by next().
     init(url: URL, password: String, minimumIterations: UInt32 = 100_000, maximumIterations: UInt32 = 10_000_000) throws {
         let handle = try FileHandle(forReadingFrom: url)
+        let header: BackupHeader
+        let key: SymmetricKey
         do {
-            let header = try BackupHeader.parse(BackupReader.read(handle, count: BackupHeader.size))
+            header = try BackupHeader.parse(BackupReader.read(handle, count: BackupHeader.size))
             guard header.iterations >= minimumIterations, header.iterations <= maximumIterations else {
                 throw BackupError.weakParameters
             }
-            self.header = header
-            self.key = try BackupCrypto.key(password: password, header: header)
-            self.handle = handle
+            key = try BackupCrypto.key(password: password, header: header)
         } catch {
             try? handle.close()
             throw error
         }
+        self.header = header
+        self.key = key
+        self.handle = handle
     }
 
     deinit {
@@ -378,9 +395,12 @@ final class BackupReader {
     /// The next manifest or file entry. Never returns .end: nil means the end
     /// frame was verified (right count, nothing after it). The first entry is
     /// always the manifest. After an error, every later call throws it again.
+    /// After close() before the end frame it throws .truncated, so an early
+    /// close is never mistaken for a verified end.
     func next() throws -> BackupEntry? {
         if let failure = failure { throw failure }
-        guard !finished, let handle = handle else { return nil }
+        if finished { return nil }
+        guard let handle = handle else { throw BackupError.truncated }
         do {
             return try readEntry(handle)
         } catch {
@@ -577,10 +597,11 @@ enum BackupPassword {
     }
 
     /// On the built-in list (also with trailing digits or symbols removed),
-    /// or made of fewer than three different characters.
+    /// or made of fewer than three different characters. A password of
+    /// spaces only counts as too common; an empty one is only too short.
     private static func isTooCommon(_ password: String) -> Bool {
         let key = password.lowercased().filter { !$0.isWhitespace }
-        guard !key.isEmpty else { return false }
+        guard !key.isEmpty else { return !password.isEmpty }
         if BackupPassword.common.contains(key) || Set(key).count < 3 { return true }
         var base = key
         while let last = base.last, !last.isLetter { base.removeLast() }

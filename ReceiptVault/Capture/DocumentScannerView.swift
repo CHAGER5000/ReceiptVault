@@ -16,12 +16,15 @@ struct DocumentScannerView: UIViewControllerRepresentable {
         return controller
     }
 
-    func updateUIViewController(_ controller: VNDocumentCameraViewController, context: Context) {}
+    func updateUIViewController(_ controller: VNDocumentCameraViewController, context: Context) {
+        // Keep the callbacks current if SwiftUI rebuilds this view.
+        context.coordinator.parent = self
+    }
 
     func makeCoordinator() -> Coordinator { Coordinator(self) }
 
     final class Coordinator: NSObject, VNDocumentCameraViewControllerDelegate {
-        let parent: DocumentScannerView
+        var parent: DocumentScannerView
         init(_ parent: DocumentScannerView) { self.parent = parent }
 
         func documentCameraViewController(_ controller: VNDocumentCameraViewController, didFinishWith scan: VNDocumentCameraScan) {

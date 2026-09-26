@@ -64,20 +64,23 @@ enum RVCalendar {
     }
 
     static func adding(days: Int, to d: DayDate) -> DayDate {
-        fromDayNumber(dayNumber(d) + days)
+        fromDayNumber(dayNumber(d) + bounded(days, 400 * RVCalendar.yearLimit))
     }
 
     /// Clamps to the end of a shorter month: 2024-01-31 + 1 = 2024-02-29.
     /// Negative values count back.
     static func adding(months: Int, to d: DayDate) -> DayDate {
-        let total = d.year * 12 + (d.month - 1) + months
+        let monthLimit: Int = 12 * RVCalendar.yearLimit
+        let startYear: Int = bounded(d.year, RVCalendar.yearLimit)
+        let startMonth: Int = bounded(d.month, monthLimit)
+        let total: Int = startYear * 12 + (startMonth - 1) + bounded(months, monthLimit)
         let year = floorDiv(total, 12)
         let month = total - year * 12 + 1
         return DayDate(year: year, month: month, day: min(max(d.day, 1), daysInMonth(year: year, month: month)))
     }
 
     static func adding(years: Int, to d: DayDate) -> DayDate {
-        adding(months: years * 12, to: d)
+        adding(months: bounded(years, RVCalendar.yearLimit) * 12, to: d)
     }
 
     /// b − a, in days.
@@ -101,7 +104,7 @@ enum RVCalendar {
     static func subtractingWorkingDays(_ n: Int, from d: DayDate) -> DayDate {
         var number = dayNumber(d)
         while isWeekend(number) { number -= 1 }
-        var left = max(n, 0)
+        var left = bounded(max(n, 0), 400 * RVCalendar.yearLimit)
         number -= (left / 5) * 7 // from a weekday, five working days are one week
         left %= 5
         while left > 0 {
@@ -125,6 +128,15 @@ enum RVCalendar {
 
     // MARK: Day numbers (days since 1970-01-01, proleptic Gregorian)
 
+    /// Inputs are held within ±1,000,000 years (months and days in
+    /// proportion) so nonsense values, such as a damaged backup's, cannot
+    /// overflow Int and crash. Every real day is untouched.
+    private static let yearLimit = 1_000_000
+
+    private static func bounded(_ value: Int, _ limit: Int) -> Int {
+        min(max(value, -limit), limit)
+    }
+
     private static func isLeap(_ year: Int) -> Bool {
         (year % 4 == 0 && year % 100 != 0) || year % 400 == 0
     }
@@ -145,14 +157,16 @@ enum RVCalendar {
     /// Howard Hinnant's days_from_civil. Months and days out of range roll
     /// over, like a lenient Calendar (2024-02-30 is 2024-03-01).
     private static func dayNumber(_ d: DayDate) -> Int {
-        let carry = floorDiv(d.month - 1, 12)
-        let year = d.year + carry
-        let month = d.month - carry * 12                  // 1...12
+        let rawMonth: Int = bounded(d.month, 12 * RVCalendar.yearLimit)
+        let rawDay: Int = bounded(d.day, 400 * RVCalendar.yearLimit)
+        let carry = floorDiv(rawMonth - 1, 12)
+        let year = bounded(d.year, RVCalendar.yearLimit) + carry
+        let month = rawMonth - carry * 12                 // 1...12
         let y = month <= 2 ? year - 1 : year
         let era = floorDiv(y, 400)
         let yoe = y - era * 400                           // 0...399
         let mp = month > 2 ? month - 3 : month + 9        // March = 0
-        let doy = (153 * mp + 2) / 5 + d.day - 1          // 0...365 for a real day
+        let doy = (153 * mp + 2) / 5 + rawDay - 1         // 0...365 for a real day
         let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy
         return era * 146_097 + doe - 719_468
     }
@@ -236,17 +250,17 @@ enum DateFinder {
 
     /// "2024-03-12" or "2024/03/12". A "-" just before is allowed only after
     /// a digit, so the end of a range ("…2025-2025-12-31") is still found.
-    private static let isoDate = compile(#"(?<![\d.,/])(?<![^\d]-)(\d{4})([-/])(\d{1,2})\2(\d{1,2})(?!\d)"#)
+    private static let isoDate = DateFinder.compile(#"(?<![\d.,/])(?<![^\d]-)(\d{4})([-/])(\d{1,2})\2(\d{1,2})(?!\d)"#)
     /// "12/03/2024", "12.03.24", "12-03-2024": the same separator twice. Not
     /// inside a longer dotted number ("1.12.03.24").
-    private static let numericDate = compile(#"(?<![\d.,/])(?<![^\d]-)(\d{1,2})([./-])(\d{1,2})\2(\d{4}|\d{2})(?!\d|[.,]\d)"#)
+    private static let numericDate = DateFinder.compile(#"(?<![\d.,/])(?<![^\d]-)(\d{1,2})([./-])(\d{1,2})\2(\d{4}|\d{2})(?!\d|[.,]\d)"#)
     /// "12 Mar 2024", "12. März 2024", "1er mars 2024", "12th March 2024",
     /// "12-Mar-2024", "12-MAR-24" (two-digit years only with - or /).
-    private static let dayFirstNamed = compile(#"(?<![\p{L}\d])(\d{1,2})(?:[eE][rR]|[sS][tT]|[nN][dD]|[rR][dD]|[tT][hH]|°|º)?(?:\.?\s?|[-/])([\p{L}\p{M}]{3,12})(?:\.?,?\s(\d{4})|\.?[-/](\d{4}|\d{2}))(?!\d)"#)
+    private static let dayFirstNamed = DateFinder.compile(#"(?<![\p{L}\d])(\d{1,2})(?:[eE][rR]|[sS][tT]|[nN][dD]|[rR][dD]|[tT][hH]|°|º)?(?:\.?\s?|[-/])([\p{L}\p{M}]{3,12})(?:\.?,?\s(\d{4})|\.?[-/](\d{4}|\d{2}))(?!\d)"#)
     /// "March 12, 2024", "Mar. 12th 2024".
-    private static let monthFirstNamed = compile(#"(?<![\p{L}\p{M}])([\p{L}\p{M}]{3,12})\.?\s(\d{1,2})(?:[sS][tT]|[nN][dD]|[rR][dD]|[tT][hH])?,?\s(\d{4})(?!\d)"#)
+    private static let monthFirstNamed = DateFinder.compile(#"(?<![\p{L}\p{M}])([\p{L}\p{M}]{3,12})\.?\s(\d{1,2})(?:[sS][tT]|[nN][dD]|[rR][dD]|[tT][hH])?,?\s(\d{4})(?!\d)"#)
     /// "14:32", "9:05", "14h32".
-    private static let timeOfDay = compile(#"(?<![\d:])(?:[01]?\d|2[0-3])[:hH][0-5]\d(?!\d)"#)
+    private static let timeOfDay = DateFinder.compile(#"(?<![\d:])(?:[01]?\d|2[0-3])[hH:][0-5]\d(?!\d)"#)
 
     /// The month for a name or abbreviation in any case, ignoring a trailing
     /// "." and, when there is no exact match, accents.
